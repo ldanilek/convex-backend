@@ -6,7 +6,7 @@ import {
   fetchTeamAndProjectForKey,
 } from "./api.js";
 import {
-  deploymentNameFromAdminKeyOrCrash,
+  deploymentNameFromAdminKey,
   deploymentTypeFromAdminKey,
   getDeploymentTypeFromConfiguredDeployment,
   isAnonymousDeployment,
@@ -23,6 +23,7 @@ import {
   CONVEX_SELF_HOSTED_ADMIN_KEY_VAR_NAME,
   CONVEX_SELF_HOSTED_URL_VAR_NAME,
   ENV_VAR_FILE_PATH,
+  OVERRIDE_CONVEX_DEPLOY_KEY_ENV_VAR_NAME,
   bigBrainAPI,
   processDeployKeyValue,
 } from "./utils/utils.js";
@@ -61,6 +62,25 @@ export async function initializeBigBrainAuth(
     envFile?: string | undefined;
   },
 ): Promise<void> {
+  const resolveEffectiveDeployKey = async (
+    rawOverrideDeployKey: string | undefined,
+    rawDeployKey: string | undefined,
+  ): Promise<string | undefined> => {
+    const overrideDeployKey = await processDeployKeyValue(
+      ctx,
+      rawOverrideDeployKey,
+    );
+    if (
+      overrideDeployKey !== undefined &&
+      (isPreviewDeployKey(overrideDeployKey) ||
+        isProjectKey(overrideDeployKey) ||
+        isDeploymentKey(overrideDeployKey))
+    ) {
+      return overrideDeployKey;
+    }
+    return await processDeployKeyValue(ctx, rawDeployKey);
+  };
+
   if (initialArgs.url !== undefined && initialArgs.adminKey !== undefined) {
     // Do not check any env vars if `url` and `adminKey` are specified via CLI
     ctx._updateBigBrainAuth(
@@ -84,8 +104,10 @@ export async function initializeBigBrainAuth(
       });
     }
     const config = dotenv.parse(existingFile);
-    const rawDeployKey = config[CONVEX_DEPLOY_KEY_ENV_VAR_NAME];
-    const deployKey = await processDeployKeyValue(ctx, rawDeployKey);
+    const deployKey = await resolveEffectiveDeployKey(
+      config[OVERRIDE_CONVEX_DEPLOY_KEY_ENV_VAR_NAME],
+      config[CONVEX_DEPLOY_KEY_ENV_VAR_NAME],
+    );
     if (deployKey !== undefined) {
       const bigBrainAuth = getBigBrainAuth(ctx, {
         previewDeployKey: isPreviewDeployKey(deployKey) ? deployKey : null,
@@ -98,8 +120,10 @@ export async function initializeBigBrainAuth(
   }
   dotenv.config({ path: ENV_VAR_FILE_PATH });
   dotenv.config();
-  const rawDeployKey = process.env[CONVEX_DEPLOY_KEY_ENV_VAR_NAME];
-  const deployKey = await processDeployKeyValue(ctx, rawDeployKey);
+  const deployKey = await resolveEffectiveDeployKey(
+    process.env[OVERRIDE_CONVEX_DEPLOY_KEY_ENV_VAR_NAME],
+    process.env[CONVEX_DEPLOY_KEY_ENV_VAR_NAME],
+  );
   if (deployKey !== undefined) {
     const bigBrainAuth = getBigBrainAuth(ctx, {
       previewDeployKey: isPreviewDeployKey(deployKey) ? deployKey : null,
@@ -417,11 +441,24 @@ async function getDeploymentSelectionFromEnv(
 ): Promise<
   { kind: "success"; metadata: DeploymentSelection } | { kind: "unknown" }
 > {
+  const rawOverrideDeployKey = getEnv(OVERRIDE_CONVEX_DEPLOY_KEY_ENV_VAR_NAME);
+  const overrideDeployKey = await processDeployKeyValue(
+    ctx,
+    rawOverrideDeployKey === null ? undefined : rawOverrideDeployKey,
+  );
+  const deployKeyFromOverride =
+    overrideDeployKey !== undefined &&
+    (isPreviewDeployKey(overrideDeployKey) ||
+      isProjectKey(overrideDeployKey) ||
+      isDeploymentKey(overrideDeployKey))
+      ? overrideDeployKey
+      : undefined;
   const rawDeployKey = getEnv(CONVEX_DEPLOY_KEY_ENV_VAR_NAME);
-  const deployKey = await processDeployKeyValue(
+  const deployKeyFromEnv = await processDeployKeyValue(
     ctx,
     rawDeployKey === null ? undefined : rawDeployKey,
   );
+  const deployKey = deployKeyFromOverride ?? deployKeyFromEnv;
   if (deployKey !== undefined) {
     const deployKeyType = isPreviewDeployKey(deployKey)
       ? "preview"
@@ -458,10 +495,7 @@ async function getDeploymentSelectionFromEnv(
         // `CONVEX_DEPLOY_KEY` is set to a deployment's deploy key.
         // Deploy to this deployment -- selectors like `--prod` / `--preview-name` will be ignored.
         // At the moment, we don't verify that there aren't other env vars that would also be used for deployment selection (e.g. `CONVEX_DEPLOYMENT`)
-        const deploymentName = await deploymentNameFromAdminKeyOrCrash(
-          ctx,
-          deployKey,
-        );
+        const deploymentName = deploymentNameFromAdminKey(deployKey);
         const deploymentType = deploymentTypeFromAdminKey(deployKey);
         // We cannot derive the deployment URL from the deploy key, because it
         // might be a custom domain. Ask big brain for the URL.
@@ -473,7 +507,10 @@ async function getDeploymentSelectionFromEnv(
             deployKey: deployKey,
           },
         });
-        const slugs = await fetchTeamAndProjectForKey(ctx, deployKey);
+        const slugs =
+          deploymentName === null
+            ? null
+            : await fetchTeamAndProjectForKey(ctx, deployKey);
         return {
           kind: "success",
           metadata: {
@@ -481,12 +518,15 @@ async function getDeploymentSelectionFromEnv(
             deploymentToActOn: {
               url: url,
               adminKey: deployKey,
-              deploymentFields: {
-                deploymentName: deploymentName,
-                deploymentType: deploymentType,
-                teamSlug: slugs.team,
-                projectSlug: slugs.project,
-              },
+              deploymentFields:
+                deploymentName === null
+                  ? null
+                  : {
+                      deploymentName: deploymentName,
+                      deploymentType: deploymentType,
+                      teamSlug: slugs!.team,
+                      projectSlug: slugs!.project,
+                    },
               source: "deployKey",
             },
           },
