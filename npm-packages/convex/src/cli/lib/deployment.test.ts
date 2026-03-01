@@ -1,5 +1,6 @@
 import { test, expect } from "vitest";
 import { changesToEnvVarFile, changesToGitIgnore } from "./deployment.js";
+import { changedEnvVarFile } from "./envvars.js";
 
 const DEPLOYMENT = {
   team: "snoops",
@@ -81,5 +82,21 @@ test("git ignore changes", () => {
   // Add .env.local (even if it's negated) to guide the user to solve the problem
   expect(changesToGitIgnore("!.env.local")).toEqual(
     "!.env.local\n.env.local\n",
+  );
+});
+
+test("override deploy key env var changes", () => {
+  expect(
+    changedEnvVarFile({
+      existingFileContent: null,
+      envVarName: "OVERRIDE_CONVEX_DEPLOY_KEY",
+      envVarValue: "preview:my-preview|key",
+      commentAfterValue: null,
+      commentOnPreviousLine:
+        "# Deployment key used by `npx convex dev --preview-name`",
+    }),
+  ).toEqual(
+    "# Deployment key used by `npx convex dev --preview-name`\n" +
+      "OVERRIDE_CONVEX_DEPLOY_KEY=preview:my-preview|key\n",
   );
 });

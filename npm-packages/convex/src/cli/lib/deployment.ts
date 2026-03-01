@@ -5,6 +5,12 @@ import {
   CONVEX_DEPLOY_KEY_ENV_VAR_NAME,
   CONVEX_DEPLOYMENT_ENV_VAR_NAME,
   ENV_VAR_FILE_PATH,
+  OVERRIDE_CONVEX_DEPLOYMENT_NAME_ENV_VAR_NAME,
+  OVERRIDE_CONVEX_DEPLOYMENT_URL_ENV_VAR_NAME,
+  OVERRIDE_CONVEX_DEPLOY_KEY_ENV_VAR_NAME,
+  OVERRIDE_CONVEX_PROJECT_SLUG_ENV_VAR_NAME,
+  OVERRIDE_CONVEX_PREVIEW_NAME_ENV_VAR_NAME,
+  OVERRIDE_CONVEX_TEAM_SLUG_ENV_VAR_NAME,
 } from "./utils/utils.js";
 import { DeploymentType } from "./api.js";
 
@@ -78,6 +84,76 @@ export async function writeDeploymentEnvVar(
     wroteToGitIgnore: false,
     changedDeploymentEnvVar,
   };
+}
+
+export async function writeOverrideDeployKeyEnvVar(
+  ctx: Context,
+  deployKey: string,
+): Promise<boolean> {
+  const existingFile = ctx.fs.exists(ENV_VAR_FILE_PATH)
+    ? ctx.fs.readUtf8File(ENV_VAR_FILE_PATH)
+    : null;
+  const changedFile = changedEnvVarFile({
+    existingFileContent: existingFile,
+    envVarName: OVERRIDE_CONVEX_DEPLOY_KEY_ENV_VAR_NAME,
+    envVarValue: deployKey,
+    commentAfterValue: null,
+    commentOnPreviousLine:
+      "# Deployment key used by `npx convex dev --preview-name`",
+  });
+  if (changedFile === null) {
+    return false;
+  }
+  ctx.fs.writeUtf8File(ENV_VAR_FILE_PATH, changedFile);
+  await gitIgnoreEnvVarFile(ctx);
+  return true;
+}
+
+export async function writePreviewDevOverrideEnvVars(
+  ctx: Context,
+  args: {
+    deployKey: string;
+    deploymentUrl: string;
+    deploymentName: string;
+    previewName: string;
+    teamSlug: string;
+    projectSlug: string;
+  },
+): Promise<boolean> {
+  const existingFile = ctx.fs.exists(ENV_VAR_FILE_PATH)
+    ? ctx.fs.readUtf8File(ENV_VAR_FILE_PATH)
+    : null;
+  let updated = false;
+  let nextFile = existingFile;
+  for (const [envVarName, envVarValue] of [
+    [OVERRIDE_CONVEX_DEPLOY_KEY_ENV_VAR_NAME, args.deployKey],
+    [OVERRIDE_CONVEX_DEPLOYMENT_URL_ENV_VAR_NAME, args.deploymentUrl],
+    [OVERRIDE_CONVEX_DEPLOYMENT_NAME_ENV_VAR_NAME, args.deploymentName],
+    [OVERRIDE_CONVEX_PREVIEW_NAME_ENV_VAR_NAME, args.previewName],
+    [OVERRIDE_CONVEX_TEAM_SLUG_ENV_VAR_NAME, args.teamSlug],
+    [OVERRIDE_CONVEX_PROJECT_SLUG_ENV_VAR_NAME, args.projectSlug],
+  ] as const) {
+    const changedFile = changedEnvVarFile({
+      existingFileContent: nextFile,
+      envVarName,
+      envVarValue,
+      commentAfterValue: null,
+      commentOnPreviousLine:
+        envVarName === OVERRIDE_CONVEX_DEPLOY_KEY_ENV_VAR_NAME
+          ? "# Preview deployment overrides used by `npx convex dev --preview-name`"
+          : null,
+    });
+    if (changedFile !== null) {
+      nextFile = changedFile;
+      updated = true;
+    }
+  }
+  if (!updated || nextFile === null) {
+    return false;
+  }
+  ctx.fs.writeUtf8File(ENV_VAR_FILE_PATH, nextFile);
+  await gitIgnoreEnvVarFile(ctx);
+  return true;
 }
 
 // Only used in the internal --url flow
@@ -185,7 +261,7 @@ export async function deploymentNameFromAdminKeyOrCrash(
   return deploymentName;
 }
 
-function deploymentNameFromAdminKey(adminKey: string) {
+export function deploymentNameFromAdminKey(adminKey: string) {
   const parts = adminKey.split("|");
   if (parts.length === 1) {
     return null;

@@ -8,11 +8,23 @@ import { devAgainstDeployment } from "./lib/dev.js";
 import { deploymentSelectionWithinProjectFromOptions } from "./lib/api.js";
 import {
   CONVEX_DEPLOYMENT_ENV_VAR_NAME,
+  OVERRIDE_CONVEX_DEPLOYMENT_NAME_ENV_VAR_NAME,
+  OVERRIDE_CONVEX_DEPLOYMENT_URL_ENV_VAR_NAME,
+  OVERRIDE_CONVEX_DEPLOY_KEY_ENV_VAR_NAME,
+  OVERRIDE_CONVEX_PROJECT_SLUG_ENV_VAR_NAME,
+  OVERRIDE_CONVEX_PREVIEW_NAME_ENV_VAR_NAME,
+  OVERRIDE_CONVEX_TEAM_SLUG_ENV_VAR_NAME,
   CONVEX_SELF_HOSTED_URL_VAR_NAME,
+  bigBrainAPI,
 } from "./lib/utils/utils.js";
 import { getDeploymentSelection } from "./lib/deploymentSelection.js";
 import { detectSuspiciousEnvironmentVariables } from "./lib/envvars.js";
 import { checkVersion } from "./lib/updates.js";
+import {
+  getTeamAndProjectFromPreviewAdminKey,
+  writePreviewDevOverrideEnvVars,
+} from "./lib/deployment.js";
+import { extractDeploymentNameForWorkOS } from "./lib/extractDeploymentNameForWorkOS.js";
 
 export const dev = new Command("dev")
   .summary("Develop against a dev deployment, watching for changes")
@@ -140,6 +152,12 @@ Same format as .env.local or .env files, and overrides them.`,
   .addOption(new Option("--skip-push").default(false).hideHelp())
   .addOption(new Option("--admin-key <adminKey>").hideHelp())
   .addOption(new Option("--url <url>").hideHelp())
+  .addOption(
+    new Option(
+      "--preview-name <previewName>",
+      "Develop against the preview deployment with the given name when using a preview deploy key.",
+    ),
+  )
   // Options for testing
   .addOption(new Option("--override-auth-url <url>").hideHelp())
   .addOption(new Option("--override-auth-client <id>").hideHelp())
@@ -235,7 +253,82 @@ Same format as .env.local or .env files, and overrides them.`,
 
     const configure =
       cmdOptions.configure === true ? "ask" : (cmdOptions.configure ?? null);
-    const deploymentSelection = await getDeploymentSelection(ctx, cmdOptions);
+    let selectionWithinProjectForCredentials = selectionWithinProject;
+    let deploymentSelection =
+      cmdOptions.previewName !== undefined &&
+      process.env[OVERRIDE_CONVEX_PREVIEW_NAME_ENV_VAR_NAME] ===
+        cmdOptions.previewName &&
+      process.env[OVERRIDE_CONVEX_DEPLOY_KEY_ENV_VAR_NAME] !== undefined &&
+      process.env[OVERRIDE_CONVEX_DEPLOYMENT_URL_ENV_VAR_NAME] !== undefined
+        ? {
+            kind: "existingDeployment" as const,
+            deploymentToActOn: {
+              url: process.env[OVERRIDE_CONVEX_DEPLOYMENT_URL_ENV_VAR_NAME],
+              adminKey: process.env[OVERRIDE_CONVEX_DEPLOY_KEY_ENV_VAR_NAME],
+              deploymentFields:
+                process.env[OVERRIDE_CONVEX_DEPLOYMENT_NAME_ENV_VAR_NAME] !==
+                  undefined &&
+                process.env[OVERRIDE_CONVEX_TEAM_SLUG_ENV_VAR_NAME] !==
+                  undefined &&
+                process.env[OVERRIDE_CONVEX_PROJECT_SLUG_ENV_VAR_NAME] !==
+                  undefined
+                  ? {
+                      deploymentName:
+                        process.env[
+                          OVERRIDE_CONVEX_DEPLOYMENT_NAME_ENV_VAR_NAME
+                        ],
+                      deploymentType: "preview" as const,
+                      projectSlug:
+                        process.env[OVERRIDE_CONVEX_PROJECT_SLUG_ENV_VAR_NAME],
+                      teamSlug:
+                        process.env[OVERRIDE_CONVEX_TEAM_SLUG_ENV_VAR_NAME],
+                    }
+                  : null,
+              source: "deployKey" as const,
+            },
+          }
+        : await getDeploymentSelection(ctx, cmdOptions);
+    if (
+      cmdOptions.previewName !== undefined &&
+      process.env[OVERRIDE_CONVEX_PREVIEW_NAME_ENV_VAR_NAME] ===
+        cmdOptions.previewName &&
+      process.env[OVERRIDE_CONVEX_DEPLOY_KEY_ENV_VAR_NAME] !== undefined &&
+      process.env[OVERRIDE_CONVEX_DEPLOYMENT_URL_ENV_VAR_NAME] !== undefined
+    ) {
+      selectionWithinProjectForCredentials = { kind: "ownDev" };
+    } else if (deploymentSelection.kind === "preview") {
+      if (cmdOptions.previewName === undefined) {
+        return await ctx.crash({
+          exitCode: 1,
+          errorType: "fatal",
+          printedMessage:
+            "When using a preview deploy key, `npx convex dev` requires `--preview-name <name>` to select or create the preview deployment.",
+        });
+      }
+      const previewDeployment = await claimPreviewDeploymentForDev(
+        ctx,
+        deploymentSelection.previewDeployKey,
+        cmdOptions.previewName,
+      );
+      process.env[OVERRIDE_CONVEX_DEPLOY_KEY_ENV_VAR_NAME] =
+        previewDeployment.adminKey;
+      deploymentSelection = {
+        kind: "existingDeployment",
+        deploymentToActOn: {
+          url: previewDeployment.instanceUrl,
+          adminKey: previewDeployment.adminKey,
+          deploymentFields: {
+            deploymentName: previewDeployment.deploymentName,
+            deploymentType: "preview",
+            projectSlug: previewDeployment.projectSlug,
+            teamSlug: previewDeployment.teamSlug,
+          },
+          source: "deployKey",
+        },
+      };
+      // We already resolved the preview deployment from preview name.
+      selectionWithinProjectForCredentials = { kind: "ownDev" };
+    }
     const credentials = await deploymentCredentialsOrConfigure(
       ctx,
       deploymentSelection,
@@ -243,7 +336,7 @@ Same format as .env.local or .env files, and overrides them.`,
       {
         ...cmdOptions,
         localOptions,
-        selectionWithinProject,
+        selectionWithinProject: selectionWithinProjectForCredentials,
       },
     );
 
@@ -276,3 +369,61 @@ Same format as .env.local or .env files, and overrides them.`,
         : []),
     ]);
   });
+
+async function claimPreviewDeploymentForDev(
+  ctx: Awaited<ReturnType<typeof oneoffContext>>,
+  previewDeployKey: string,
+  previewName: string,
+) {
+  const { teamSlug, projectSlug } = await getTeamAndProjectFromPreviewAdminKey(
+    ctx,
+    previewDeployKey,
+  );
+  const data = await bigBrainAPI<{
+    adminKey: string | undefined;
+    instanceUrl: string | undefined;
+  }>({
+    ctx,
+    method: "POST",
+    url: "claim_preview_deployment",
+    data: {
+      projectSelection: {
+        kind: "teamAndProjectSlugs",
+        teamSlug,
+        projectSlug,
+      },
+      identifier: previewName,
+    },
+  });
+  if (data.adminKey === undefined || data.instanceUrl === undefined) {
+    return await ctx.crash({
+      exitCode: 1,
+      errorType: "transient",
+      printedMessage: "Unexpected response while claiming preview deployment",
+    });
+  }
+  const deploymentName = extractDeploymentNameForWorkOS(data.instanceUrl);
+  if (deploymentName === null) {
+    return await ctx.crash({
+      exitCode: 1,
+      errorType: "transient",
+      printedMessage:
+        "Unexpected response while claiming preview deployment (invalid deployment URL).",
+    });
+  }
+  await writePreviewDevOverrideEnvVars(ctx, {
+    deployKey: data.adminKey,
+    deploymentUrl: data.instanceUrl,
+    deploymentName,
+    previewName,
+    teamSlug,
+    projectSlug,
+  });
+  return {
+    teamSlug,
+    projectSlug,
+    deploymentName,
+    adminKey: data.adminKey,
+    instanceUrl: data.instanceUrl,
+  };
+}
